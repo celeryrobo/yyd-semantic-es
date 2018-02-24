@@ -1,25 +1,23 @@
 package com.yyd.semantic.handler;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 
-import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.admin.indices.analyze.AnalyzeResponse;
-import org.elasticsearch.action.admin.indices.analyze.AnalyzeResponse.AnalyzeToken;
-import org.elasticsearch.action.search.SearchResponse;
 import org.elasticsearch.client.Client;
 import org.elasticsearch.common.xcontent.XContentFactory;
-import org.elasticsearch.index.query.QueryBuilders;
 import org.elasticsearch.search.SearchHit;
-import org.elasticsearch.search.SearchHits;
 
 import com.yyd.semantic.http.error.BadRequestError;
 import com.yyd.semantic.http.handler.RequestHandler;
 import com.yyd.semantic.http.request.IRequest;
 import com.yyd.semantic.http.response.IResponse;
+import com.yyd.semantic.plugin.Configration;
+import com.yyd.semantic.service.SemanticService;
+import com.yyd.semantic.service.SemanticService.SemanticResult;
 
 public class SemanticHandler extends RequestHandler {
 	@Override
@@ -29,27 +27,34 @@ public class SemanticHandler extends RequestHandler {
 		if (lang == null || userIdentify == null) {
 			throw new BadRequestError();
 		}
-		String[] indexs = { "song", "story", "poetry" };
 		Map<String, Object> slots = new HashMap<>();
 		Map<String, Object> semantic = new HashMap<>();
 		Map<String, Object> result = new HashMap<>();
 		result.put("slots", slots);
 		result.put("semantic", semantic);
+		List<SearchHit> searchResults = new ArrayList<>();
+		Map<String, List<String>> params = new HashMap<>();
 		try (Client client = getClient()) {
-			for (String index : indexs) {
-				slots.clear();
-				semantic.clear();
-				result.put("words", "");
-				System.out.println("\nCut Word Index : " + index + " Lang : " + lang);
-				AnalyzeResponse analyzeResponse = client.admin().indices().prepareAnalyze(index, lang)
-						.setAnalyzer(index + "_ansj").get();
-				ActionListener<AnalyzeResponse> analyzeAction = new AnalyzeActionListener(client, result, index);
-				try {
-					analyzeAction.onResponse(analyzeResponse);
-					break;
-				} catch (Exception e) {
-					continue;
-				}
+			Map<String, List<String>> WORDS = Configration.WORDS;
+			for (Map.Entry<String, List<String>> entry : WORDS.entrySet()) {
+				System.out.println("\nCut Word Service : " + entry.getKey() + " Lang : " + lang);
+				SemanticService semanticService = new SemanticService(client, entry.getKey(), entry.getValue());
+				SemanticResult semanticResult = semanticService.parse(lang);
+				System.out.println(semanticResult);
+				searchResults.addAll(semanticResult.search());
+				params.put(entry.getKey(), semanticResult.getEntities());
+			}
+		}
+		Collections.sort(searchResults, (e1, e2) -> {
+			return (int) (e2.getScore() * 1000) - (int) (e1.getScore() * 1000);
+		});
+		searchResults.forEach((e) -> {
+			System.out.println(e.getSourceAsString() + "   " + e.getScore());
+		});
+		System.out.println("=============================");
+		for (SearchHit searchHit : searchResults) {
+			if (buildResult(result, searchHit, params)) {
+				break;
 			}
 		}
 		try {
@@ -60,94 +65,24 @@ public class SemanticHandler extends RequestHandler {
 		}
 	}
 
-	private static final class AnalyzeActionListener implements ActionListener<AnalyzeResponse> {
-		private Client client;
-		private Map<String, Object> result;
-		private String indexName;
-
-		public AnalyzeActionListener(Client client, Map<String, Object> result, String indexName) {
-			this.client = client;
-			this.result = result;
-			this.indexName = indexName;
-		}
-
-		@Override
-		public void onResponse(AnalyzeResponse response) {
-			StringBuilder langs = new StringBuilder();
-			StringBuilder words = new StringBuilder();
-			List<String> entities = new LinkedList<>();
-			for (AnalyzeToken e : response) {
-				String term = e.getTerm();
-				String type = e.getType();
-				words.append(term).append("/").append(type).append(" ");
-				if (type.startsWith("c:")) {
-					String category = type.substring(2);
-					entities.add(term);
-					langs.append("{").append(category).append("}");
-				} else {
-					langs.append(term);
-				}
+	@SuppressWarnings("unchecked")
+	private boolean buildResult(Map<String, Object> result, SearchHit searchHit, Map<String, List<String>> kvs) {
+		System.out.println(searchHit.getSourceAsString());
+		Map<String, Object> slots = (Map<String, Object>) result.get("slots");
+		Map<String, Object> semantic = (Map<String, Object>) result.get("semantic");
+		List<String> entities = kvs.get(searchHit.getIndex());
+		semantic.put("service", searchHit.getIndex());
+		Map<String, Object> source = searchHit.getSourceAsMap();
+		String paramStr = (String) source.get("params");
+		String[] params = paramStr == null || paramStr.isEmpty() ? new String[0] : paramStr.split(",");
+		if (params.length == entities.size()) {
+			semantic.put("template", source.get("orgTemplate"));
+			semantic.put("intent", source.get("intent"));
+			for (int i = 0; i < params.length; i++) {
+				slots.put(params[i], entities.get(i));
 			}
-			result.put("words", words.toString().trim());
-			System.out.println(words);
-			System.out.println(langs);
-			SearchResponse searchResponse = client.prepareSearch().setQuery(QueryBuilders.matchQuery("template", langs))
-					.setIndices(indexName).setSize(10).get();
-			ActionListener<SearchResponse> searchAction = new SearchActionListener(result, entities);
-			try {
-				searchAction.onResponse(searchResponse);
-			} catch (Exception e) {
-				searchAction.onFailure(e);
-			}
+			return true;
 		}
-
-		@Override
-		public void onFailure(Exception e) {
-			throw new RuntimeException(e);
-		}
-	}
-
-	private static final class SearchActionListener implements ActionListener<SearchResponse> {
-		private Map<String, Object> result;
-		private List<String> entities;
-
-		public SearchActionListener(Map<String, Object> result, List<String> entities) {
-			this.result = result;
-			this.entities = entities;
-		}
-
-		@SuppressWarnings("unchecked")
-		@Override
-		public void onResponse(SearchResponse response) {
-			SearchHits hits = response.getHits();
-			hits.forEach((e) -> {
-				System.out.println(e.getSourceAsString() + " : " + e.getScore());
-			});
-			if (hits.totalHits == 0) {
-				throw new RuntimeException();
-			}
-			Map<String, Object> semantic = (Map<String, Object>) result.get("semantic");
-			for (SearchHit hit : hits) {
-				semantic.put("service", hit.getIndex());
-				Map<String, Object> source = hit.getSourceAsMap();
-				String paramStr = (String) source.get("params");
-				String[] params = paramStr == null || paramStr.isEmpty() ? new String[0] : paramStr.split(",");
-				if (params.length == entities.size()) {
-					semantic.put("template", source.get("orgTemplate"));
-					semantic.put("intent", source.get("intent"));
-					Map<String, Object> slots = (Map<String, Object>) result.get("slots");
-					for (int i = 0; i < params.length; i++) {
-						slots.put(params[i], entities.get(i));
-					}
-					return;
-				}
-			}
-			throw new RuntimeException();
-		}
-
-		@Override
-		public void onFailure(Exception e) {
-			throw new RuntimeException(e);
-		}
+		return false;
 	}
 }
