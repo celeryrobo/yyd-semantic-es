@@ -68,6 +68,7 @@ public class SemanticHandler extends RequestHandler {
 	@SuppressWarnings("unchecked")
 	private boolean buildResult(Map<String, Object> result, SearchHit searchHit, Map<String, List<String>> kvs) {
 		System.out.println(searchHit.getSourceAsString());
+		System.out.println(kvs);
 		Map<String, Object> slots = (Map<String, Object>) result.get("slots");
 		Map<String, Object> semantic = (Map<String, Object>) result.get("semantic");
 		List<String> entities = kvs.get(searchHit.getIndex());
@@ -81,8 +82,10 @@ public class SemanticHandler extends RequestHandler {
 			for (int i = 0; i < params.length; i++) {
 				slots.put(params[i], entities.get(i));
 			}
+			result.put("success", true);
 			return true;
 		}
+		result.put("success", false);
 		return false;
 	}
 }
